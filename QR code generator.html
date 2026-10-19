@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Offline QR Code Generator</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px system-ui, sans-serif; }
+    body { max-width: 760px; margin: 3rem auto; padding: 0 1rem; }
+    h1 { margin-bottom: .4rem; }
+    p { color: GrayText; }
+    textarea { box-sizing: border-box; width: 100%; min-height: 8rem; padding: .8rem; font: inherit; }
+    button { margin: .8rem .5rem .8rem 0; padding: .65rem 1rem; font: inherit; cursor: pointer; }
+    fieldset { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 1rem; margin: 1rem 0; padding: 1rem; }
+    fieldset label { display: grid; gap: .4rem; align-content: start; }
+    input, select { font: inherit; }
+    input[type="color"] { width: 100%; height: 2.5rem; }
+    input[type="range"] { width: 100%; }
+    #preview { display: none; box-sizing: border-box; width: min(100%, 400px); height: auto; }
+    #status { min-height: 1.5em; }
+    .hint { margin: .25rem 0; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <h1>Offline QR Code Generator</h1>
+  <p>Runs entirely in your browser. Supports UTF-8 text up to 78 bytes.</p>
+  <label for="content">Text or URL</label>
+  <textarea id="content" placeholder="Enter text or a URL"></textarea>
+  <fieldset>
+    <legend>QR code appearance</legend>
+    <label for="foreground">QR color
+      <input id="foreground" type="color" value="#000000">
+    </label>
+    <label for="background">Background color
+      <input id="background" type="color" value="#ffffff">
+    </label>
+    <label for="border-color">Border color
+      <input id="border-color" type="color" value="#333333">
+    </label>
+    <label for="border-width">Border thickness
+      <input id="border-width" type="range" min="0" max="24" step="2" value="4">
+      <span id="border-width-value">4 px</span>
+    </label>
+    <label for="border-style">Border style
+      <select id="border-style">
+        <option value="solid">Solid</option>
+        <option value="rounded">Rounded</option>
+        <option value="dashed">Dashed</option>
+      </select>
+    </label>
+    <label for="caption">Caption (optional; printed below the QR code)
+      <input id="caption" type="text" maxlength="80" placeholder="e.g. Scan to visit my website">
+    </label>
+    <label for="logo">Logo image (optional)
+      <input id="logo" type="file" accept="image/*">
+    </label>
+    <label for="logo-size">Logo size
+      <input id="logo-size" type="range" min="10" max="30" step="2" value="18">
+      <span id="logo-size-value">18% of QR width</span>
+    </label>
+  </fieldset>
+  <p class="hint">A logo covers part of the QR code and may make it harder to scan. Use a small logo and test the downloaded image with your scanner.</p>
+  <div>
+    <button id="generate" type="button">Generate QR code</button>
+    <button id="download" type="button" disabled>Download PNG</button>
+  </div>
+  <p id="status" role="status"></p>
+  <canvas id="preview" aria-label="Generated QR code"></canvas>
+
+  <script>
+    // Compact QR byte-mode encoder, error-correction level L, versions 1–4.
+    (() => {
+      const content = document.querySelector('#content');
+      const canvas = document.querySelector('#preview');
+      const status = document.querySelector('#status');
+      const download = document.querySelector('#download');
+      const foreground = document.querySelector('#foreground');
+      const background = document.querySelector('#background');
+      const borderColor = document.querySelector('#border-color');
+      const borderWidth = document.querySelector('#border-width');
+      const borderStyle = document.querySelector('#border-style');
+      const caption = document.querySelector('#caption');
+      const logoInput = document.querySelector('#logo');
+      const logoSize = document.querySelector('#logo-size');
+      const borderWidthValue = document.querySelector('#border-width-value');
+      const logoSizeValue = document.querySelector('#logo-size-value');
+      const capacities = [17, 32, 53, 78];
+      let logoImage = null;
+
+      function multiply(a, b) {
+        let product = 0;
+        for (let i = 7; i >= 0; i--) {
+          product = (product << 1) ^ ((product >>> 7) * 0x11d);
+          product ^= ((b >>> i) & 1) * a;
+        }
+        return product;
+      }
+
+      function divisor(degree) {
+        const result = Array(degree).fill(0);
+        result[degree - 1] = 1;
+        let root = 1;
+        for (let i = 0; i < degree; i++) {
+          for (let j = 0; j < degree; j++) {
+            result[j] = multiply(result[j], root);
+            if (j + 1 < degree) result[j] ^= result[j + 1];
+          }
+          root = multiply(root, 2);
+        }
+        return result;
+      }
+
+      function remainder(data, degree) {
+        const poly = divisor(degree);
+        const result = Array(degree).fill(0);
+        for (const byte of data) {
+          const factor = byte ^ result.shift();
+          result.push(0);
+          for (let i = 0; i < degree; i++) result[i] ^= multiply(poly[i], factor);
+        }
+        return result;
+      }
+
+      function makeCodewords(bytes, version) {
+        const dataSizes = [19, 34, 55, 80];
+        const eccSizes = [7, 10, 15, 20];
+        const capacity = dataSizes[version - 1];
+        const bits = [];
+        const append = (value, length) => {
+          for (let i = length - 1; i >= 0; i--) bits.push((value >>> i) & 1);
+        };
+        append(0b0100, 4); // Byte mode
+        append(bytes.length, 8);
+        for (const byte of bytes) append(byte, 8);
+        for (let i = 0; i < Math.min(4, capacity * 8 - bits.length); i++) bits.push(0);
+        while (bits.length % 8) bits.push(0);
+        const data = [];
+        for (let i = 0; i < bits.length; i += 8) {
+          data.push(bits.slice(i, i + 8).reduce((n, bit) => (n << 1) | bit, 0));
+        }
+        for (let pad = 0; data.length < capacity; pad++) data.push(pad % 2 ? 0x11 : 0xec);
+        return data.concat(remainder(data, eccSizes[version - 1]));
+      }
+
+      function makeMatrix(codewords, version) {
+        const size = version * 4 + 17;
+        const matrix = Array.from({ length: size }, () => Array(size).fill(null));
+        const set = (x, y, value) => { matrix[y][x] = !!value; };
+
+        function finder(cx, cy) {
+          for (let dy = -1; dy <= 7; dy++) for (let dx = -1; dx <= 7; dx++) {
+            const x = cx + dx, y = cy + dy;
+            if (x < 0 || y < 0 || x >= size || y >= size) continue;
+            const inside = dx >= 0 && dx <= 6 && dy >= 0 && dy <= 6;
+            set(x, y, inside && (dx === 0 || dx === 6 || dy === 0 || dy === 6 ||
+              (dx >= 2 && dx <= 4 && dy >= 2 && dy <= 4)));
+          }
+        }
+        finder(0, 0); finder(size - 7, 0); finder(0, size - 7);
+
+        for (let i = 8; i < size - 8; i++) {
+          if (matrix[6][i] === null) set(i, 6, i % 2 === 0);
+          if (matrix[i][6] === null) set(6, i, i % 2 === 0);
+        }
+        if (version > 1) {
+          const center = 4 * version + 10;
+          for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+            set(center + dx, center + dy,
+              Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+          }
+        }
+
+        // Reserve format-information modules.
+        for (let i = 0; i <= 5; i++) matrix[i][8] = false;
+        matrix[7][8] = matrix[8][8] = matrix[8][7] = false;
+        for (let i = 9; i < 15; i++) matrix[8][14 - i] = false;
+        for (let i = 0; i < 8; i++) matrix[8][size - 1 - i] = false;
+        for (let i = 8; i < 15; i++) matrix[size - 15 + i][8] = false;
+        matrix[size - 8][8] = true; // Fixed dark module
+
+        const bits = codewords.flatMap(byte =>
+          Array.from({ length: 8 }, (_, i) => (byte >>> (7 - i)) & 1));
+        let bitIndex = 0;
+        for (let right = size - 1; right >= 1; right -= 2) {
+          if (right === 6) right--;
+          for (let step = 0; step < size; step++) {
+            const y = ((right + 1) & 2) === 0 ? size - 1 - step : step;
+            for (let offset = 0; offset < 2; offset++) {
+              const x = right - offset;
+              if (matrix[y][x] !== null) continue;
+              const bit = bitIndex < bits.length ? bits[bitIndex++] : 0;
+              set(x, y, bit ^ ((x + y) % 2 === 0)); // Mask 0
+            }
+          }
+        }
+
+        // Format bits: level L (01), mask 0, BCH remainder, then XOR mask.
+        const data = 0b01000;
+        let rem = data;
+        for (let i = 0; i < 10; i++) rem = (rem << 1) ^ (((rem >>> 9) & 1) * 0x537);
+        const format = ((data << 10) | rem) ^ 0x5412;
+        const bit = i => ((format >>> i) & 1) !== 0;
+        for (let i = 0; i <= 5; i++) set(8, i, bit(i));
+        set(8, 7, bit(6)); set(8, 8, bit(7)); set(7, 8, bit(8));
+        for (let i = 9; i < 15; i++) set(14 - i, 8, bit(i));
+        for (let i = 0; i < 8; i++) set(size - 1 - i, 8, bit(i));
+        for (let i = 8; i < 15; i++) set(8, size - 15 + i, bit(i));
+        set(8, size - 8, true);
+        return matrix;
+      }
+
+      function render(text) {
+        const bytes = Array.from(new TextEncoder().encode(text));
+        const version = capacities.findIndex(max => bytes.length <= max) + 1;
+        if (!text || version === 0) {
+          status.textContent = text ? `Input is too long (${bytes.length} UTF-8 bytes; maximum 78).` : 'Enter text to generate a QR code.';
+          canvas.style.display = 'none'; download.disabled = true;
+          return;
+        }
+        const matrix = makeMatrix(makeCodewords(bytes, version), version);
+        const scale = 8, quiet = 4, qrExtent = (matrix.length + quiet * 2) * scale;
+        const frameWidth = Number(borderWidth.value);
+        const frameGap = 14;
+        const captionLines = caption.value.trim() ? 2 : 0;
+        const captionHeight = captionLines ? captionLines * 22 + 12 : 0;
+        const framePadding = frameWidth + frameGap;
+        canvas.width = qrExtent + framePadding * 2;
+        canvas.height = qrExtent + framePadding * 2 + captionHeight;
+        const ctx = canvas.getContext('2d');
+        const colors = {
+          foreground: foreground.value,
+          background: background.value,
+          border: borderColor.value
+        };
+        ctx.fillStyle = colors.background;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        if (frameWidth > 0) {
+          ctx.strokeStyle = colors.border;
+          ctx.lineWidth = frameWidth;
+          ctx.setLineDash(borderStyle.value === 'dashed' ? [frameWidth * 2, frameWidth * 1.5] : []);
+          if (borderStyle.value === 'rounded') {
+            const radius = Math.max(frameWidth * 2, 10);
+            ctx.beginPath();
+            ctx.roundRect(frameWidth / 2, frameWidth / 2, canvas.width - frameWidth, canvas.height - frameWidth, radius);
+            ctx.stroke();
+          } else {
+            ctx.strokeRect(frameWidth / 2, frameWidth / 2, canvas.width - frameWidth, canvas.height - frameWidth);
+          }
+          ctx.setLineDash([]);
+        }
+        const qrLeft = framePadding;
+        const qrTop = framePadding;
+        ctx.fillStyle = colors.foreground;
+        matrix.forEach((row, y) => row.forEach((dark, x) => {
+          if (dark) ctx.fillRect(qrLeft + (x + quiet) * scale, qrTop + (y + quiet) * scale, scale, scale);
+        }));
+        if (logoImage) {
+          const maxSize = qrExtent * Number(logoSize.value) / 100;
+          const ratio = Math.min(maxSize / logoImage.naturalWidth, maxSize / logoImage.naturalHeight);
+          const width = logoImage.naturalWidth * ratio;
+          const height = logoImage.naturalHeight * ratio;
+          const centerX = qrLeft + qrExtent / 2;
+          const centerY = qrTop + qrExtent / 2;
+          const backingSize = maxSize + 10;
+          ctx.fillStyle = colors.background;
+          ctx.fillRect(centerX - backingSize / 2, centerY - backingSize / 2, backingSize, backingSize);
+          ctx.drawImage(logoImage, centerX - width / 2, centerY - height / 2, width, height);
+        }
+        if (captionLines) {
+          const words = caption.value.trim().split(/\s+/);
+          const maxWidth = qrExtent;
+          const lines = [];
+          let line = '';
+          ctx.font = '16px system-ui, sans-serif';
+          for (const word of words) {
+            const candidate = line ? `${line} ${word}` : word;
+            if (line && ctx.measureText(candidate).width > maxWidth) {
+              lines.push(line);
+              line = word;
+              if (lines.length === captionLines) {
+                const lastLine = lines.length - 1;
+                let truncated = `${lines[lastLine]}…`;
+                while (truncated.length > 1 && ctx.measureText(truncated).width > maxWidth) {
+                  truncated = `${truncated.slice(0, -2)}…`;
+                }
+                lines[lastLine] = truncated;
+                line = '';
+                break;
+              }
+            } else {
+              line = candidate;
+            }
+          }
+          if (line) lines.push(line);
+          ctx.fillStyle = colors.foreground;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          lines.forEach((lineText, index) => {
+            ctx.fillText(lineText, canvas.width / 2, qrTop + qrExtent + 12 + index * 22, maxWidth);
+          });
+        }
+        canvas.style.display = 'block'; download.disabled = false;
+        status.textContent = `Generated version ${version} QR code (${bytes.length} UTF-8 bytes).`;
+      }
+
+      document.querySelector('#generate').addEventListener('click', () => render(content.value));
+      const appearanceControls = [foreground, background, borderColor, borderWidth, borderStyle, caption, logoSize];
+      appearanceControls.forEach(control => control.addEventListener('input', () => {
+        borderWidthValue.textContent = `${borderWidth.value} px`;
+        logoSizeValue.textContent = `${logoSize.value}% of QR width`;
+        if (canvas.style.display !== 'none') render(content.value);
+      }));
+      logoInput.addEventListener('change', () => {
+        const file = logoInput.files && logoInput.files[0];
+        if (!file) {
+          logoImage = null;
+          if (canvas.style.display !== 'none') render(content.value);
+          return;
+        }
+        if (!file.type.startsWith('image/')) {
+          status.textContent = 'Please select a valid image file for the logo.';
+          logoInput.value = '';
+          return;
+        }
+        const reader = new FileReader();
+        reader.onerror = () => {
+          status.textContent = 'Could not read the selected logo image.';
+        };
+        reader.onload = () => {
+          if (typeof reader.result !== 'string') {
+            status.textContent = 'Could not read the selected logo image.';
+            return;
+          }
+          const image = new Image();
+          image.onload = () => {
+            logoImage = image;
+            if (canvas.style.display !== 'none') render(content.value);
+          };
+          image.onerror = () => {
+            status.textContent = 'The selected file could not be loaded as an image.';
+          };
+          image.src = reader.result;
+        };
+        reader.readAsDataURL(file);
+      });
+      download.addEventListener('click', () => {
+        const link = document.createElement('a');
+        link.download = 'qr-code.png'; link.href = canvas.toDataURL('image/png'); link.click();
+      });
+    })();
+  </script>
+</body>
+</html>
